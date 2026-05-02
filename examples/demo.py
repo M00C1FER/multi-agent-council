@@ -13,8 +13,11 @@ result = council.deliberate(
 
 print(f"Topic     : {result.topic}")
 print(f"Confidence: {result.confidence:.0%}")
-print(f"Decision  : {result.chairman_synthesis}")
+if result.chairman_synthesis:
+    print(f"Decision  : {result.chairman_synthesis}")
+if result.minority_report:
+    print(f"Dissent   : {result.minority_report}")
 print()
 for phase, output in result.phase_outputs.items():
     print(f"── {phase} ──")
-    print(f"  {output.summary[:120]}")
+    print(f"  {output[:120]}")

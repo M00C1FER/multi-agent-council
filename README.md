@@ -26,6 +26,7 @@ Simple "ask multiple AIs" approaches produce redundant output. Multi-Agent Counc
 
 ```bash
 bash install.sh
+council --phases                                      # list the 7 phases
 council --topic "Should this service use gRPC or REST?" --dry-run
 council --topic "..." --backends claude,gemini
 ```
@@ -34,7 +35,11 @@ council --topic "..." --backends claude,gemini
 
 | Platform | Method |
 |----------|--------|
-| Linux / WSL | `bash install.sh` |
+| Debian / Ubuntu (apt) | `bash install.sh` |
+| Arch / Manjaro (pacman) | `bash install.sh` |
+| Fedora / RHEL / Rocky (dnf) | `bash install.sh` |
+| Alpine (apk) | `bash install.sh` |
+| WSL2 (Ubuntu base) | `bash install.sh` |
 | Termux (Android) | `bash install.sh` (no sudo) |
 | pip | `pip install .` |
 
@@ -50,15 +55,15 @@ bash install.sh
 from multi_agent_council import Council, SubprocessBackend
 
 council = Council(backends=[
-    SubprocessBackend("claude", cmd="claude"),
-    SubprocessBackend("gemini", cmd="gemini"),
+    SubprocessBackend("claude", cmd_template=["claude", "--print", "--file", "{prompt_file}"]),
+    SubprocessBackend("gemini", cmd_template=["gemini", "{prompt_file}"]),
 ])
 
 result = council.deliberate("Should we use Go or Rust for the network daemon?")
 
 for phase, output in result.phase_outputs.items():
     print(f"\n── {phase} ──")
-    print(output.summary)
+    print(output[:200])
 
 print(f"\nDecision: {result.chairman_synthesis}")
 print(f"Confidence: {result.confidence:.0%}")
@@ -81,10 +86,14 @@ multi-agent-council/
 ├── src/multi_agent_council/
 │   ├── council.py         # 7-phase state machine + ConsensusEngine bridge
 │   └── __init__.py
-├── install.sh             # Cross-platform wizard
+├── tests/
+│   ├── test_council.py        # Smoke tests
+│   └── test_state_machine.py  # Hypothesis property tests for the state machine
+├── install.sh             # Cross-platform wizard (apt/dnf/pacman/apk/termux)
 ├── examples/
 │   ├── demo.py            # Dry-run two-agent council
 │   └── custom_backend.py  # Implementing CLIBackend ABC
+├── REFERENCES.md          # Reference projects studied during audit
 └── TOOLS.md
 ```
 
@@ -93,25 +102,36 @@ The `CLIBackend` ABC makes adding any AI CLI (or local model) a one-class extens
 ## Adding a Custom Backend
 
 ```python
-from multi_agent_council import CLIBackend, Message
+from multi_agent_council import CLIBackend
 
 class OllamaBackend(CLIBackend):
-    name = "ollama"
+    def __init__(self, model: str = "llama3"):
+        self._model = model
 
-    def send(self, message: Message) -> str:
+    @property
+    def name(self) -> str:
+        return f"ollama-{self._model}"
+
+    def query(self, prompt: str, timeout: int = 120) -> str:
         import subprocess
         result = subprocess.run(
-            ["ollama", "run", "llama3", message.content],
-            capture_output=True, text=True, timeout=120
+            ["ollama", "run", self._model, prompt],
+            capture_output=True, text=True, timeout=timeout
         )
         return result.stdout.strip()
 ```
 
 ## Cross-Platform Notes
 
-- **Linux/WSL:** Full feature set
-- **Termux:** Works if AI CLIs are installed in Termux PATH
-- **CI/offline:** Use `--dry-run` for pipeline testing
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Debian 12/13, Ubuntu 22.04/24.04 | ✅ Tier 1 | Full feature set via `apt` |
+| Arch / Manjaro | ✅ Tier 2 | Via `pacman` |
+| Fedora / RHEL / Rocky | ✅ Tier 2 | Via `dnf` |
+| Alpine | ✅ Best-effort | Via `apk`; `python3-venv` not needed (pip works) |
+| WSL2 (Ubuntu base) | ✅ Tier 1 | No `/sys/firmware/efi` assumptions |
+| Termux (Android arm64) | ✅ | No `sudo`; uses `pkg` instead of system package manager |
+| CI / offline | ✅ | Use `--dry-run` for pipeline testing without real AI calls |
 
 ## License
 
