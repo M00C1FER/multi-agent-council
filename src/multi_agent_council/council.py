@@ -612,16 +612,23 @@ class Council:
         total_calls = len(self.PHASES) * len(self.backends)
         confidence = max(0.0, 1.0 - (error_count / max(total_calls, 1)))
 
-        # Derive chairman_synthesis from the COUNCIL phase (first non-empty line)
+        # Derive chairman_synthesis: first non-error, non-empty line from COUNCIL phase.
         council_output = phase_outputs.get("COUNCIL", "")
-        chairman_synthesis = council_output.splitlines()[0].strip() if council_output else ""
-
-        # Derive minority_report: look for [TIMEOUT or [ERROR responses in COUNCIL phase
-        minority_lines = [
-            line for line in council_output.splitlines()
-            if line.strip() and "[ERROR:" not in line and "[TIMEOUT" not in line
+        non_error_lines = [
+            line.strip()
+            for line in council_output.splitlines()
+            if line.strip()
+            and not line.strip().startswith("[ERROR:")
+            and not line.strip().startswith("[TIMEOUT")
         ]
-        minority_report = minority_lines[-1].strip() if len(minority_lines) > 1 else ""
+        chairman_synthesis = non_error_lines[0] if non_error_lines else ""
+
+        # minority_report requires structured per-agent tracking available in
+        # HeadlessCouncil (pydantic schemas). Council.deliberate() produces a
+        # flat combined string per phase, so dissent detection is not possible
+        # here without re-parsing. Return empty string; callers needing full
+        # minority tracking should use HeadlessCouncil directly.
+        minority_report = ""
 
         return CouncilResult(
             topic=topic,
