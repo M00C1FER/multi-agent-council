@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 class CLIBackend(ABC):
     """Abstract base for CLI backends participating in council deliberation."""
 
+    @property
     @abstractmethod
     def name(self) -> str:
         """Human-readable identifier for this backend."""
@@ -51,6 +52,7 @@ class SubprocessBackend(CLIBackend):
         self._cmd_template = cmd_template
         self._timeout = timeout
 
+    @property
     def name(self) -> str:
         return self._name
 
@@ -174,7 +176,7 @@ def execute_with_schema(agent, prompt: str, schema_class: type[BaseModel], max_r
 
     for attempt in range(max_retries + 1):
         try:
-            raw_response = agent.execute(enforced_prompt, timeout=timeout)
+            raw_response = agent.query(enforced_prompt, timeout=timeout)
 
             parsed_dict = extract_json(raw_response)
             validated = schema_class(**parsed_dict)
@@ -206,7 +208,14 @@ class HeadlessCouncil:
         self.agents = []
         for position, name in enumerate(agent_names):
             role_info = get_role_info(name, position=position)
-            agent = get_backend(name)
+            # Create a SubprocessBackend from the CLI name; the default
+            # cmd_template passes the prompt via a temp file as the first arg.
+            # Users wanting non-default invocation should construct backends
+            # explicitly and call HeadlessCouncil.from_backends() instead.
+            agent = SubprocessBackend(
+                backend_name=name,
+                cmd_template=[name, "{prompt_file}"],
+            )
             self.agents.append(agent)
             self.agent_roles[agent.name] = role_info
 
@@ -215,8 +224,42 @@ class HeadlessCouncil:
             "REFINE": {}, "COUNCIL": {}, "DEBRIEF": {}
         }
 
+    @classmethod
+    def from_backends(cls, topic: str, backends: "List[CLIBackend]") -> "HeadlessCouncil":
+        """Construct a :class:`HeadlessCouncil` from pre-built :class:`CLIBackend` instances.
+
+        Use this when you need full control over the command template or timeout
+        for each backend (e.g. ``claude --print --file {prompt_file}``).
+        """
+        instance = object.__new__(cls)
+        instance.topic = topic
+        instance.agent_roles = {}
+        instance.agents = []
+        for position, backend in enumerate(backends):
+            role_info = get_role_info(backend.name, position=position)
+            instance.agents.append(backend)
+            instance.agent_roles[backend.name] = role_info
+        instance.state = {
+            "BRIEF": {}, "RECON": {}, "INTEL": {}, "WARGAME": {},
+            "REFINE": {}, "COUNCIL": {}, "DEBRIEF": {}
+        }
+        return instance
+
     def _print_phase(self, phase_name: str) -> None:
         print(f"\n\033[1;36m═════ COUNCIL — PHASE: {phase_name} ═════\033[0m")
+
+    def _run_agent_phase(self, agent: "CLIBackend", prompt: str, schema_class: type, timeout: int = 7200) -> "BaseModel | None":
+        """Run a single agent through a phase, catching and logging any errors.
+
+        Returns the validated schema instance, or ``None`` if the agent failed
+        (timed out, unavailable, or returned unparse-able output).  Callers
+        must guard against ``None`` before accessing schema attributes.
+        """
+        try:
+            return execute_with_schema(agent, prompt, schema_class, timeout=timeout)
+        except Exception as exc:
+            logger.error(f"@{agent.name} failed phase ({type(exc).__name__}): {exc}")
+            return None
 
     def run(self) -> None:
         # PHASE 1: BRIEF
@@ -230,8 +273,9 @@ class HeadlessCouncil:
                 f"Task: State your understanding, 3 critical questions, initial position, and assumptions."
             )
             print(f"  → [@{agent.name}] Briefing...")
-            res = execute_with_schema(agent, prompt, BriefSchema)
-            self.state["BRIEF"][agent.name] = res
+            res = self._run_agent_phase(agent, prompt, BriefSchema)
+            if res is not None:
+                self.state["BRIEF"][agent.name] = res
 
         # PHASE 2: RECON
         self._print_phase("RECON (Deep Research & Analysis)")
@@ -246,8 +290,9 @@ class HeadlessCouncil:
                 f"Provide core findings, exhaustive evidence/data, and identify risks."
             )
             print(f"  → [@{agent.name}] Conducting Deep Reconnaissance... (Timeout: 2 hours)")
-            res = execute_with_schema(agent, prompt, ReconSchema, timeout=7200)
-            self.state["RECON"][agent.name] = res
+            res = self._run_agent_phase(agent, prompt, ReconSchema, timeout=7200)
+            if res is not None:
+                self.state["RECON"][agent.name] = res
 
         # PHASE 3: INTEL (Blackboard Sync)
         self._print_phase("INTEL (Blackboard Synthesis)")
@@ -263,14 +308,21 @@ class HeadlessCouncil:
                 f"Task: Identify agreements, disagreements, gaps, and synthesize stronger elements."
             )
             print(f"  → [@{agent.name}] Synthesizing Intel...")
-            res = execute_with_schema(agent, prompt, IntelSchema)
-            self.state["INTEL"][agent.name] = res
+            res = self._run_agent_phase(agent, prompt, IntelSchema)
+            if res is not None:
+                self.state["INTEL"][agent.name] = res
 
         # PHASE 4: WARGAME (Adversarial)
         self._print_phase("WARGAME (Adversarial Challenge & Verification)")
         for i, agent in enumerate(self.agents):
             target = self.agents[(i + 1) % len(self.agents)].name
-            target_pos = self.state["BRIEF"].get(target, BriefSchema(understanding="", critical_questions=[], initial_position="", assumptions=[])).initial_position
+            brief_fallback = BriefSchema(
+                understanding="",
+                critical_questions=[],
+                initial_position="",
+                assumptions=[],
+            )
+            target_pos = self.state["BRIEF"].get(target, brief_fallback).initial_position
             target_recon = self.state["RECON"].get(target)
 
             prompt = (
@@ -281,8 +333,9 @@ class HeadlessCouncil:
                 f"CRITICAL: Use your web search and MCP research tools to ACTIVELY VERIFY and fact-check the target's claims. If their data is flawed, prove it with external sources. Take up to 45 minutes if needed."
             )
             print(f"  → [@{agent.name}] Challenging @{target}... (Timeout: 1 hour)")
-            res = execute_with_schema(agent, prompt, WargameSchema, timeout=3600)
-            self.state["WARGAME"][agent.name] = res # agent's challenge against target
+            res = self._run_agent_phase(agent, prompt, WargameSchema, timeout=3600)
+            if res is not None:
+                self.state["WARGAME"][agent.name] = res
 
         # PHASE 5: REFINE
         self._print_phase("REFINE (Position Update & Fact Checking)")
@@ -297,8 +350,9 @@ class HeadlessCouncil:
                 f"CRITICAL INSTRUCTION: Do NOT blindly concede or defend. Use your MCP and web search tools to ACTIVELY verify the counterarguments. Dig deep into the sources. You have up to 45 minutes to fact-check before finalizing your position."
             )
             print(f"  → [@{agent.name}] Refining Position... (Timeout: 1 hour)")
-            res = execute_with_schema(agent, prompt, RefineSchema, timeout=3600)
-            self.state["REFINE"][agent.name] = res
+            res = self._run_agent_phase(agent, prompt, RefineSchema, timeout=3600)
+            if res is not None:
+                self.state["REFINE"][agent.name] = res
 
         # PHASE 6: COUNCIL
         self._print_phase("COUNCIL (Formal Vote & Synthesis)")
@@ -313,14 +367,15 @@ class HeadlessCouncil:
                 f"Task: Endorse/reject positions, state top 3 conclusions, write minority report, and assess overall confidence."
             )
             print(f"  → [@{agent.name}] Voting in Council...")
-            res = execute_with_schema(agent, prompt, CouncilSchema)
-            self.state["COUNCIL"][agent.name] = res
+            res = self._run_agent_phase(agent, prompt, CouncilSchema)
+            if res is not None:
+                self.state["COUNCIL"][agent.name] = res
 
         # PHASE 7: DEBRIEF
         self._print_phase("DEBRIEF (After Action Review)")
         council_consensus = ""
-        for name, council in self.state["COUNCIL"].items():
-            council_consensus += f"--- @{name} CONCLUSIONS ---\n{json.dumps(council.model_dump(), indent=2)}\n\n"
+        for name, council_vote in self.state["COUNCIL"].items():
+            council_consensus += f"--- @{name} CONCLUSIONS ---\n{json.dumps(council_vote.model_dump(), indent=2)}\n\n"
 
         for agent in self.agents:
             prompt = (
@@ -329,8 +384,9 @@ class HeadlessCouncil:
                 f"Task: Identify success points, missed points, and rate the process."
             )
             print(f"  → [@{agent.name}] Debriefing...")
-            res = execute_with_schema(agent, prompt, DebriefSchema)
-            self.state["DEBRIEF"][agent.name] = res
+            res = self._run_agent_phase(agent, prompt, DebriefSchema)
+            if res is not None:
+                self.state["DEBRIEF"][agent.name] = res
 
         self._finalize()
 
@@ -370,24 +426,63 @@ class HeadlessCouncil:
         return final_md
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Headless JSON-structured Think Tank")
-    parser.add_argument("agents", help="Comma-separated agent names (e.g. claude,gemini,copilot)")
-    parser.add_argument("topic", help="The topic to deliberate on")
-    parser.add_argument("--mode", default="collaborate", help="Mode (ignored in headless think_tank dictating specific phases)")
-    parser.add_argument("--depth", default="standard", help="Depth preset")
-    parser.add_argument("--turns", type=int, default=0, help="Max turns")
-    parser.add_argument("--budget", type=int, default=0, help="Time budget in seconds")
-    parser.add_argument("--cli-list", help="Fallback original string from bash script", default="")
+    parser = argparse.ArgumentParser(
+        description="Multi-Agent Council — 7-phase structured deliberation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  council --topic 'gRPC vs REST?' --dry-run\n"
+            "  council --topic '...' --backends claude,gemini\n"
+            "  council --phases\n"
+        ),
+    )
+    parser.add_argument("--topic", required=False, default="", help="Topic to deliberate on")
+    parser.add_argument(
+        "--backends",
+        default="",
+        help="Comma-separated backend CLI names (e.g. claude,gemini,copilot)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate all 7 phases with echo backends — no real AI calls",
+    )
+    parser.add_argument(
+        "--phases",
+        action="store_true",
+        help="List the 7 council phases and exit",
+    )
 
     args = parser.parse_args()
 
-    agent_list = [a.strip() for a in args.agents.split(",") if a.strip()]
-    if args.cli_list:
-        agent_list = [a.strip() for a in args.cli_list.split(",") if a.strip()]
+    if args.phases:
+        print("Council phases (in order):")
+        for i, phase in enumerate(_COUNCIL_PHASES, 1):
+            print(f"  {i}. {phase}")
+        return
 
+    if not args.topic:
+        parser.error("--topic is required (or use --phases to list phases)")
+
+    if args.dry_run:
+        backends: "List[CLIBackend]" = [DryRunBackend("agent-a"), DryRunBackend("agent-b")]
+        council_obj = Council(backends=backends)
+        result = council_obj.deliberate(args.topic, dry_run=True)
+        print(f"\nTopic     : {result.topic}")
+        print(f"Confidence: {result.confidence:.0%}")
+        if result.chairman_synthesis:
+            print(f"Decision  : {result.chairman_synthesis}")
+        if result.minority_report:
+            print(f"Dissent   : {result.minority_report}")
+        print()
+        for phase, output in result.phase_outputs.items():
+            print(f"── {phase} ──")
+            print(f"  {output[:120]}")
+        return
+
+    agent_list = [a.strip() for a in args.backends.split(",") if a.strip()]
     if len(agent_list) < 2:
-        print("Headless Council requires at least 2 agents.")
-        sys.exit(1)
+        parser.error("--backends requires at least 2 comma-separated backend names")
 
     council = HeadlessCouncil(args.topic, agent_list)
     try:
@@ -421,6 +516,7 @@ class DryRunBackend(CLIBackend):
     def __init__(self, backend_name: str) -> None:
         self._name = backend_name
 
+    @property
     def name(self) -> str:
         return self._name
 
@@ -438,10 +534,14 @@ class CouncilResult:
         phase_outputs: Mapping of phase name → combined backend responses.
             Always contains exactly 7 keys: ``BRIEF``, ``RECON``, ``INTEL``,
             ``WARGAME``, ``REFINE``, ``COUNCIL``, ``DEBRIEF``.
+        chairman_synthesis: High-level synthesis produced from the COUNCIL phase.
+        minority_report: Dissenting positions (empty string if unanimous).
     """
     topic: str
     confidence: float
     phase_outputs: "Dict[str, str]"
+    chairman_synthesis: str = ""
+    minority_report: str = ""
 
     def __post_init__(self) -> None:
         for phase in _COUNCIL_PHASES:
@@ -500,8 +600,8 @@ class Council:
                 try:
                     resp = backend.query(phase_prompt, timeout=60)
                 except Exception as exc:  # noqa: BLE001
-                    resp = f"[ERROR:{backend.name()}] {exc}"
-                responses.append(f"[{backend.name()}] {resp}")
+                    resp = f"[ERROR:{backend.name}] {exc}"
+                responses.append(f"[{backend.name}] {resp}")
             combined = "\n".join(responses)
             phase_outputs[phase] = combined
             cumulative_context += f"\n### {phase}\n{combined}\n"
@@ -512,8 +612,28 @@ class Council:
         total_calls = len(self.PHASES) * len(self.backends)
         confidence = max(0.0, 1.0 - (error_count / max(total_calls, 1)))
 
+        # Derive chairman_synthesis: first non-error, non-empty line from COUNCIL phase.
+        council_output = phase_outputs.get("COUNCIL", "")
+        non_error_lines = [
+            line.strip()
+            for line in council_output.splitlines()
+            if line.strip()
+            and not line.strip().startswith("[ERROR:")
+            and not line.strip().startswith("[TIMEOUT")
+        ]
+        chairman_synthesis = non_error_lines[0] if non_error_lines else ""
+
+        # minority_report requires structured per-agent tracking available in
+        # HeadlessCouncil (pydantic schemas). Council.deliberate() produces a
+        # flat combined string per phase, so dissent detection is not possible
+        # here without re-parsing. Return empty string; callers needing full
+        # minority tracking should use HeadlessCouncil directly.
+        minority_report = ""
+
         return CouncilResult(
             topic=topic,
             confidence=round(confidence, 4),
             phase_outputs=phase_outputs,
+            chairman_synthesis=chairman_synthesis,
+            minority_report=minority_report,
         )

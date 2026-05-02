@@ -1,18 +1,21 @@
 """Example: implement CLIBackend for a local Ollama model."""
 import subprocess
-from multi_agent_council import CLIBackend, Message
+from multi_agent_council import CLIBackend
 
 
 class OllamaBackend(CLIBackend):
     """Run a local Ollama model as a council participant."""
-    name = "ollama"
 
     def __init__(self, model: str = "llama3"):
-        self.model = model
+        self._model = model
 
-    def send(self, message: Message) -> str:
+    @property
+    def name(self) -> str:
+        return f"ollama-{self._model}"
+
+    def query(self, prompt: str, timeout: int = 120) -> str:
         result = subprocess.run(
-            ["ollama", "run", self.model, message.content],
-            capture_output=True, text=True, timeout=120,
+            ["ollama", "run", self._model, prompt],
+            capture_output=True, text=True, timeout=timeout,
         )
         return result.stdout.strip()

@@ -9,13 +9,13 @@ description = "Structured 7-phase council deliberation framework for multi-AI-CL
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-dependencies = ["pyyaml>=6.0", "rich>=13.0"]
+dependencies = ["pyyaml>=6.0", "rich>=13.0", "pydantic>=2.0"]
 
 [project.scripts]
 council = "multi_agent_council.council:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-cov"]
+dev = ["pytest>=8.0", "pytest-cov", "hypothesis>=6.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
