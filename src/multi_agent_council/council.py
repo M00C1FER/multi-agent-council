@@ -2,7 +2,8 @@ import sys
 import argparse
 import json
 import logging
-from typing import List, Literal, Dict
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal
 from pydantic import BaseModel, Field
 
 
@@ -397,3 +398,122 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── Public API additions ──────────────────────────────────────────────────
+
+_COUNCIL_PHASES = ("BRIEF", "RECON", "INTEL", "WARGAME", "REFINE", "COUNCIL", "DEBRIEF")
+
+
+class DryRunBackend(CLIBackend):
+    """A no-op backend for testing that echoes the topic without calling any external CLI.
+
+    Args:
+        backend_name: Human-readable name returned by :meth:`name`.
+
+    Example::
+
+        backends = [DryRunBackend("agent_a"), DryRunBackend("agent_b")]
+        council = Council(backends)
+        result = council.deliberate("Is Python better than Go?", dry_run=True)
+    """
+
+    def __init__(self, backend_name: str) -> None:
+        self._name = backend_name
+
+    def name(self) -> str:
+        return self._name
+
+    def query(self, prompt: str, timeout: int = 120) -> str:  # noqa: ARG002
+        return f"[DryRun:{self._name}] Acknowledged: {prompt[:80]}"
+
+
+@dataclass
+class CouncilResult:
+    """Result of a :class:`Council` deliberation.
+
+    Attributes:
+        topic: The deliberation topic.
+        confidence: Aggregate confidence score (0.0–1.0).
+        phase_outputs: Mapping of phase name → combined backend responses.
+            Always contains exactly 7 keys: ``BRIEF``, ``RECON``, ``INTEL``,
+            ``WARGAME``, ``REFINE``, ``COUNCIL``, ``DEBRIEF``.
+    """
+    topic: str
+    confidence: float
+    phase_outputs: "Dict[str, str]"
+
+    def __post_init__(self) -> None:
+        for phase in _COUNCIL_PHASES:
+            self.phase_outputs.setdefault(phase, "")
+
+
+class Council:
+    """High-level 7-phase think-tank council.
+
+    This is a simplified, dependency-free interface for driving the 7-phase
+    deliberation protocol without the full NEXUS daemon stack.  Each phase
+    queries all *backends* in round-robin fashion; responses are aggregated
+    into a single :class:`CouncilResult`.
+
+    Args:
+        backends: List of :class:`CLIBackend` implementations to include.
+            At least one backend is required.
+
+    Example::
+
+        backends = [DryRunBackend("claude"), DryRunBackend("gemini")]
+        result = Council(backends).deliberate("Evaluate microservices vs monolith")
+        print(result.confidence)
+    """
+
+    PHASES = _COUNCIL_PHASES
+
+    def __init__(self, backends: "List[CLIBackend]") -> None:
+        if not backends:
+            raise ValueError("Council requires at least one backend.")
+        self.backends = backends
+
+    def deliberate(self, topic: str, dry_run: bool = False) -> CouncilResult:  # noqa: ARG002
+        """Run the 7-phase deliberation and return a :class:`CouncilResult`.
+
+        Args:
+            topic: The question or subject to deliberate on.
+            dry_run: When *True*, backends are called exactly as normal — the
+                flag is present for API compatibility with callers that want
+                to signal intent; use :class:`DryRunBackend` to suppress
+                actual subprocess calls.
+
+        Returns:
+            :class:`CouncilResult` with outputs for all 7 phases.
+        """
+        phase_outputs: "Dict[str, str]" = {}
+        cumulative_context = f"Topic: {topic}\n"
+
+        for phase in self.PHASES:
+            phase_prompt = (
+                f"{cumulative_context}\n--- Phase: {phase} ---\n"
+                f"Provide your analysis for the {phase} phase of the deliberation."
+            )
+            responses = []
+            for backend in self.backends:
+                try:
+                    resp = backend.query(phase_prompt, timeout=60)
+                except Exception as exc:  # noqa: BLE001
+                    resp = f"[ERROR:{backend.name()}] {exc}"
+                responses.append(f"[{backend.name()}] {resp}")
+            combined = "\n".join(responses)
+            phase_outputs[phase] = combined
+            cumulative_context += f"\n### {phase}\n{combined}\n"
+
+        # Simple confidence: fraction of backends that produced non-error responses
+        all_responses = "\n".join(phase_outputs.values())
+        error_count = all_responses.count("[ERROR:")
+        total_calls = len(self.PHASES) * len(self.backends)
+        confidence = max(0.0, 1.0 - (error_count / max(total_calls, 1)))
+
+        return CouncilResult(
+            topic=topic,
+            confidence=round(confidence, 4),
+            phase_outputs=phase_outputs,
+        )
