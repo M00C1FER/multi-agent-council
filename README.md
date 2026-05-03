@@ -79,12 +79,47 @@ council --topic "..." --dry-run
 
 Dry-run simulates all 7 phases with echo backends — useful for testing council structure without real AI invocations.
 
+## Task Attestation
+
+The `task_attestation` module lets each participating agent cryptographically sign its phase output. Downstream consumers and the ConsensusEngine can verify that a DEBRIEF synthesis was produced by the declared backend, detect tampering, and enforce quorum before accepting a result.
+
+```python
+from multi_agent_council.task_attestation import TaskAttestation, Attestation
+
+# Attest a phase output at the end of any council phase
+ta = TaskAttestation(signer_id="claude", secret="shared-hmac-secret")
+attestation: Attestation = ta.attest(
+    task_id="council-2026-04-30-001",
+    phase="COUNCIL",
+    payload={"synthesis": "...", "confidence": 0.92},
+)
+print(attestation.signature)   # HMAC-SHA256 hex digest
+print(attestation.ts)          # ISO-8601 timestamp
+
+# Verify before accepting into ConsensusEngine
+assert ta.verify(attestation), "Attestation signature mismatch — reject output"
+```
+
+**`Attestation` fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | `str` | Unique council session + phase identifier |
+| `phase` | `str` | Council phase name (`BRIEF` … `DEBRIEF`) |
+| `signer_id` | `str` | CLI/agent that produced the output |
+| `payload_hash` | `str` | SHA-256 of canonical JSON payload (hex, 64 chars) |
+| `signature` | `str` | HMAC-SHA256(task_id + phase + payload_hash, secret) |
+| `ts` | `str` | ISO-8601 UTC timestamp of attestation |
+
+**Why attestation matters in a multi-agent council:** In adversarial phases (WARGAME), one agent challenges another's output. Without attestation, a compromised or hallucinating backend can silently substitute a different payload between INTEL sharing and COUNCIL voting. Signed attestations make substitution detectable.
+
 ## Architecture (MOSA)
 
 ```
 multi-agent-council/
 ├── src/multi_agent_council/
-│   ├── council.py         # 7-phase state machine + ConsensusEngine bridge
+│   ├── council.py           # 7-phase state machine + ConsensusEngine bridge
+│   ├── task_attestation.py  # HMAC-SHA256 phase-output signing + verification
 │   └── __init__.py
 ├── tests/
 │   ├── test_council.py        # Smoke tests
